@@ -32,7 +32,6 @@ SmoothST (**S**\ patio\ **T**\ emporal) does the same as SmoothT, except the pix
 The first and last rows and the first and last columns are not processed by SmoothST.
 
 Parameters:
-
    clip
       Clip to process. Only constant format 8..16 bits supported.
 
