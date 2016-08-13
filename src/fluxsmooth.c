@@ -491,9 +491,9 @@ static void VS_CC fluxSmoothCreate(const VSMap *in, VSMap *out, void *userData, 
 
    if (!isConstantFormat(d.vi) || d.vi->format->sampleType != stInteger || d.vi->format->bitsPerSample > 16) {
       if (function == SpatioTemporalFlux) {
-         vsapi->setError(out, "SmoothST: Only 8..16 bit integer input supported.");
+         vsapi->setError(out, "SmoothST: Only 8..16 bit integer input with constant format and dimensions supported.");
       } else {
-         vsapi->setError(out, "SmoothT: Only 8..16 bit integer input supported.");
+         vsapi->setError(out, "SmoothT: Only 8..16 bit integer input with constant format and dimensions supported.");
       }
       vsapi->freeNode(d.node);
       return;
