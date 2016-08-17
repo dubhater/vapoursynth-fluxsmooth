@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(FLUXSMOOTH_X86)
+#include <emmintrin.h>
+#endif
+
 #include <VSHelper.h>
 #include <VapourSynth.h>
 
@@ -19,23 +23,204 @@ typedef struct {
     int spatial_threshold;
     int process[3];
 
-    void (*temporal_function)(const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, intptr_t, intptr_t, intptr_t, intptr_t);
+    void (*temporal_function)(const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, int, int, int, int);
     void (*spatiotemporal_function)(const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, int, int, int, int, int);
 } FluxSmoothData;
 
 
-static void VS_CC fluxSmoothInit(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
-    FluxSmoothData *d = (FluxSmoothData *)*instanceData;
-    vsapi->setVideoInfo(d->vi, 1, node);
+#if defined(FLUXSMOOTH_X86)
+static void fluxsmooth_temporal_uint8_sse2(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, int width, int height, int stride, int threshold) {
+    (void)width;
+
+#define zeroes _mm_setzero_si128()
+
+    const __m128i bytes_sign_bit = _mm_set1_epi8(128);
+
+    const __m128i bytes_threshold = _mm_add_epi8(_mm_set1_epi8(threshold), bytes_sign_bit);
+
+    const __m128i words_multiplier3 = _mm_set1_epi16(10923);
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < stride; x += 16) {
+            __m128i prev = _mm_load_si128((const __m128i *)&srcpp[x]);
+            __m128i curr = _mm_load_si128((const __m128i *)&srccp[x]);
+            __m128i next = _mm_load_si128((const __m128i *)&srcnp[x]);
+
+            __m128i count = _mm_set1_epi8(3);
+
+            __m128i prev_diff = _mm_or_si128(_mm_subs_epu8(prev, curr),
+                                             _mm_subs_epu8(curr, prev));
+            prev_diff = _mm_add_epi8(prev_diff, bytes_sign_bit);
+
+            __m128i prev_mask = _mm_cmpgt_epi8(prev_diff, bytes_threshold);
+            count = _mm_add_epi8(count, prev_mask); // add -1 (255) or 0
+            __m128i selected_prev_pixels = _mm_andnot_si128(prev_mask, prev);
+
+            __m128i next_diff = _mm_or_si128(_mm_subs_epu8(curr, next),
+                                             _mm_subs_epu8(next, curr));
+            next_diff = _mm_add_epi8(next_diff, bytes_sign_bit);
+
+            __m128i next_mask = _mm_cmpgt_epi8(next_diff, bytes_threshold);
+            count = _mm_add_epi8(count, next_mask); // add -1 (255) or 0
+            __m128i selected_next_pixels = _mm_andnot_si128(next_mask, next);
+
+            __m128i sumlo = _mm_unpacklo_epi8(curr, zeroes);
+            sumlo = _mm_add_epi16(sumlo, _mm_unpacklo_epi8(selected_prev_pixels, zeroes));
+            sumlo = _mm_add_epi16(sumlo, _mm_unpacklo_epi8(selected_next_pixels, zeroes));
+
+            __m128i sumhi = _mm_unpackhi_epi8(curr, zeroes);
+            sumhi = _mm_add_epi16(sumhi, _mm_unpackhi_epi8(selected_prev_pixels, zeroes));
+            sumhi = _mm_add_epi16(sumhi, _mm_unpackhi_epi8(selected_next_pixels, zeroes));
+
+            sumlo = _mm_slli_epi16(sumlo, 1);
+            sumhi = _mm_slli_epi16(sumhi, 1);
+
+            sumlo = _mm_add_epi16(sumlo, _mm_unpacklo_epi8(count, zeroes));
+            sumhi = _mm_add_epi16(sumhi, _mm_unpackhi_epi8(count, zeroes));
+
+            __m128i average_three = _mm_packus_epi16(_mm_mulhi_epi16(sumlo, words_multiplier3),
+                                                     _mm_mulhi_epi16(sumhi, words_multiplier3));
+
+            __m128i average_two = _mm_packus_epi16(_mm_srli_epi16(sumlo, 2),
+                                                   _mm_srli_epi16(sumhi, 2));
+
+            __m128i m4 = _mm_and_si128(next_mask, prev_mask);
+            __m128i m8 = _mm_xor_si128(next_mask, prev_mask);
+            __m128i m6 = _mm_or_si128(m4, m8);
+
+            m4 = _mm_and_si128(m4, curr);               // middle pixels only
+            m8 = _mm_and_si128(m8, average_two);        // average of two pixels
+            m6 = _mm_andnot_si128(m6, average_three);   // average of three pixels
+
+            m4 = _mm_or_si128(m4, m6);
+            m4 = _mm_or_si128(m4, m8);
+
+            __m128i m3 = curr;
+
+            prev = _mm_add_epi8(prev, bytes_sign_bit);
+            curr = _mm_add_epi8(curr, bytes_sign_bit);
+            next = _mm_add_epi8(next, bytes_sign_bit);
+
+            __m128i m5, m7;
+
+            m5 = _mm_cmpgt_epi8(curr, prev);
+            m6 = _mm_cmpgt_epi8(curr, next);
+            m5 = _mm_and_si128(m5, m6);
+
+            m6 = _mm_cmpgt_epi8(prev, curr);
+            m7 = _mm_cmpgt_epi8(next, curr);
+            m6 = _mm_and_si128(m6, m7);
+
+            m5 = _mm_or_si128(m5, m6);
+
+            m6 = _mm_and_si128(m5, m4);
+            m5 = _mm_andnot_si128(m5, m3);
+            m5 = _mm_or_si128(m5, m6);
+
+            _mm_store_si128((__m128i *)&dstp[x], m5);
+        }
+
+        srcpp += stride;
+        srccp += stride;
+        srcnp += stride;
+        dstp += stride;
+    }
 }
 
 
-extern void fluxsmooth_temporal_uint8_sse2(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, intptr_t width, intptr_t height, intptr_t stride, intptr_t threshold);
+static void fluxsmooth_temporal_uint16_sse2(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, int width, int height, int stride, int threshold) {
+    (void)width;
 
-extern void fluxsmooth_temporal_uint16_sse2(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, intptr_t width, intptr_t height, intptr_t stride, intptr_t threshold);
+    __m128i words_sign_bit = _mm_set1_epi16(0x8000);
+
+    __m128i words_threshold = _mm_add_epi16(_mm_set1_epi16(threshold), words_sign_bit);
+
+    __m128 floats_0_5 = _mm_set1_ps(0.5f);
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < stride; x += 16) {
+            __m128i prev = _mm_load_si128((const __m128i *)&srcpp[x]);
+            __m128i curr = _mm_load_si128((const __m128i *)&srccp[x]);
+            __m128i next = _mm_load_si128((const __m128i *)&srcnp[x]);
+
+            __m128i count = _mm_set1_epi16(3);
+
+            __m128i prev_diff = _mm_or_si128(_mm_subs_epu16(prev, curr),
+                                             _mm_subs_epu16(curr, prev));
+            prev_diff = _mm_add_epi16(prev_diff, words_sign_bit);
+
+            __m128i prev_mask = _mm_cmpgt_epi16(prev_diff, words_threshold);
+            count = _mm_add_epi16(count, prev_mask); // add -1 (65535) or 0
+            __m128i selected_prev_pixels = _mm_andnot_si128(prev_mask, prev);
+
+            __m128i next_diff = _mm_or_si128(_mm_subs_epu16(curr, next),
+                                             _mm_subs_epu16(next, curr));
+            next_diff = _mm_add_epi16(next_diff, words_sign_bit);
+
+            __m128i next_mask = _mm_cmpgt_epi16(next_diff, words_threshold);
+            count = _mm_add_epi16(count, next_mask); // add -1 (65535) or 0
+            __m128i selected_next_pixels = _mm_andnot_si128(next_mask, next);
+
+            __m128i sumlo = _mm_unpacklo_epi16(curr, zeroes);
+            sumlo = _mm_add_epi32(sumlo, _mm_unpacklo_epi16(selected_prev_pixels, zeroes));
+            sumlo = _mm_add_epi32(sumlo, _mm_unpacklo_epi16(selected_next_pixels, zeroes));
+
+            __m128i sumhi = _mm_unpackhi_epi16(curr, zeroes);
+            sumhi = _mm_add_epi32(sumhi, _mm_unpackhi_epi16(selected_prev_pixels, zeroes));
+            sumhi = _mm_add_epi32(sumhi, _mm_unpackhi_epi16(selected_next_pixels, zeroes));
+
+            __m128 fcountlo = _mm_cvtepi32_ps(_mm_unpacklo_epi16(count, zeroes));
+            __m128 fcounthi = _mm_cvtepi32_ps(_mm_unpackhi_epi16(count, zeroes));
+
+            __m128 favglo = _mm_mul_ps(_mm_cvtepi32_ps(sumlo), _mm_rcp_ps(fcountlo));
+            __m128 favghi = _mm_mul_ps(_mm_cvtepi32_ps(sumhi), _mm_rcp_ps(fcounthi));
+
+            favglo = _mm_add_ps(favglo, floats_0_5);
+            favghi = _mm_add_ps(favghi, floats_0_5);
+
+            __m128i avglo = _mm_cvttps_epi32(favglo);
+            __m128i avghi = _mm_cvttps_epi32(favghi);
+
+            avglo = _mm_srai_epi32(_mm_slli_epi32(_mm_add_epi16(avglo, words_sign_bit), 16), 16);
+            avghi = _mm_srai_epi32(_mm_slli_epi32(_mm_add_epi16(avghi, words_sign_bit), 16), 16);
+            __m128i avg = _mm_add_epi16(_mm_packs_epi32(avglo, avghi), words_sign_bit);
+
+            __m128i m3 = curr;
+
+            prev = _mm_add_epi16(prev, words_sign_bit);
+            curr = _mm_add_epi16(curr, words_sign_bit);
+            next = _mm_add_epi16(next, words_sign_bit);
+
+            __m128i m5 = _mm_cmpgt_epi16(curr, prev);
+            __m128i m6 = _mm_cmpgt_epi16(curr, next);
+            m5 = _mm_and_si128(m5, m6);
+
+            m6 = _mm_cmpgt_epi16(prev, curr);
+            __m128i m7 = _mm_cmpgt_epi16(next, curr);
+            m6 = _mm_and_si128(m6, m7);
+
+            m5 = _mm_or_si128(m5, m6);
+
+            m6 = _mm_and_si128(m5, avg);
+            m5 = _mm_andnot_si128(m5, m3);
+            m5 = _mm_or_si128(m5, m6);
+
+            _mm_store_si128((__m128i *)&dstp[x], m5);
+        }
+
+        srcpp += stride;
+        srccp += stride;
+        srcnp += stride;
+        dstp += stride;
+    }
+
+#undef zeroes
+}
 
 
-#ifndef USE_ASM
+#else // FLUXSMOOTH_X86
+
+
 static void fluxsmooth_temporal_uint8_c(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, int width, int height, int stride, int threshold) {
     int x, y;
     int16_t magic_numbers[] = { 0, 32767, 16384, 10923 };
@@ -123,7 +308,13 @@ static void fluxsmooth_temporal_uint16_c(const uint8_t *srcpp, const uint8_t *sr
         dstp += stride;
     }
 }
-#endif
+#endif // FLUXSMOOTH_X86
+
+
+static void VS_CC fluxSmoothInit(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
+    FluxSmoothData *d = (FluxSmoothData *)*instanceData;
+    vsapi->setVideoInfo(d->vi, 1, node);
+}
 
 
 static const VSFrameRef *VS_CC fluxSmoothTGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
@@ -549,14 +740,14 @@ static void VS_CC fluxSmoothCreate(const VSMap *in, VSMap *out, void *userData, 
 
     // Select the functions.
     if (d.vi->format->bytesPerSample == 1) {
-#ifdef USE_ASM
+#if defined(FLUXSMOOTH_X86)
         d.temporal_function = fluxsmooth_temporal_uint8_sse2;
 #else
         d.temporal_function = fluxsmooth_temporal_uint8_c;
 #endif
         d.spatiotemporal_function = fluxsmooth_spatiotemporal_uint8_c;
     } else {
-#ifdef USE_ASM
+#if defined(FLUXSMOOTH_X86)
         d.temporal_function = fluxsmooth_temporal_uint16_sse2;
 #else
         d.temporal_function = fluxsmooth_temporal_uint16_c;
