@@ -30,6 +30,14 @@ typedef struct FluxSmoothData {
 
 
 #if defined(FLUXSMOOTH_X86)
+
+#ifdef _WIN32
+#define FORCE_INLINE __forceinline
+#else
+#define FORCE_INLINE inline __attribute__((always_inline))
+#endif
+
+
 static void fluxsmooth_temporal_uint8_sse2(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, int width, int height, int stride, int temporal_threshold, int spatial_threshold) {
     (void)width;
     (void)spatial_threshold;
@@ -216,6 +224,113 @@ static void fluxsmooth_temporal_uint16_sse2(const uint8_t *srcpp, const uint8_t 
         srcnp += stride;
         dstp += stride;
     }
+}
+
+
+static FORCE_INLINE void fluxsmooth_spatiotemporal_mmword_uint8_sse2(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, int x, int stride, const __m128i words_temporal_threshold, const __m128i words_spatial_threshold) {
+    __m128i prev = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srcpp[x]), zeroes);
+    __m128i curr = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x]), zeroes);
+    __m128i next = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srcnp[x]), zeroes);
+    // "n" for "neighbour"
+    __m128i n1 = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x - stride - 1]), zeroes);
+    __m128i n2 = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x - stride]),     zeroes);
+    __m128i n3 = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x - stride + 1]), zeroes);
+    __m128i n4 = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x - 1]),          zeroes);
+    __m128i n5 = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x + 1]),          zeroes);
+    __m128i n6 = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x + stride - 1]), zeroes);
+    __m128i n7 = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x + stride]),     zeroes);
+    __m128i n8 = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x + stride + 1]), zeroes);
+
+    __m128i count = _mm_set1_epi16(11);
+    __m128i sum = curr;
+
+#define CHECK_NEIGHBOUR(n, threshold) \
+    __m128i n##_diff = _mm_or_si128(_mm_subs_epu16(n, curr), \
+                                    _mm_subs_epu16(curr, n)); \
+    __m128i n##_mask = _mm_cmpgt_epi16(n##_diff, threshold); \
+    count = _mm_add_epi16(count, n##_mask); \
+    sum = _mm_add_epi16(sum, _mm_andnot_si128(n##_mask, n));
+
+    CHECK_NEIGHBOUR(prev, words_temporal_threshold)
+    CHECK_NEIGHBOUR(next, words_temporal_threshold)
+    CHECK_NEIGHBOUR(n1, words_spatial_threshold)
+    CHECK_NEIGHBOUR(n2, words_spatial_threshold)
+    CHECK_NEIGHBOUR(n3, words_spatial_threshold)
+    CHECK_NEIGHBOUR(n4, words_spatial_threshold)
+    CHECK_NEIGHBOUR(n5, words_spatial_threshold)
+    CHECK_NEIGHBOUR(n6, words_spatial_threshold)
+    CHECK_NEIGHBOUR(n7, words_spatial_threshold)
+    CHECK_NEIGHBOUR(n8, words_spatial_threshold)
+
+#undef CHECK_NEIGHBOUR
+
+    __m128 fcountlo = _mm_cvtepi32_ps(_mm_unpacklo_epi16(count, zeroes));
+    __m128 fcounthi = _mm_cvtepi32_ps(_mm_unpackhi_epi16(count, zeroes));
+
+    __m128 favglo = _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(sum, zeroes)),
+                               _mm_rcp_ps(fcountlo));
+    __m128 favghi = _mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(sum, zeroes)),
+                               _mm_rcp_ps(fcounthi));
+
+    const __m128 floats_0_5 = _mm_set1_ps(0.5f);
+
+    favglo = _mm_add_ps(favglo, floats_0_5);
+    favghi = _mm_add_ps(favghi, floats_0_5);
+
+    __m128i avg = _mm_packs_epi32(_mm_cvttps_epi32(favglo),
+                                  _mm_cvttps_epi32(favghi));
+
+    __m128i m0 = _mm_and_si128(_mm_cmpgt_epi16(curr, prev),
+                               _mm_cmpgt_epi16(curr, next));
+    __m128i m1 = _mm_and_si128(_mm_cmpgt_epi16(prev, curr),
+                               _mm_cmpgt_epi16(next, curr));
+
+    m0 = _mm_or_si128(m0, m1);
+
+    m1 = _mm_or_si128(_mm_and_si128(m0, avg),
+                      _mm_andnot_si128(m0, curr));
+
+    _mm_storel_epi64((__m128i *)&dstp[x],
+                     _mm_packus_epi16(m1, zeroes));
+}
+
+
+static void fluxsmooth_spatiotemporal_uint8_sse2(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, int width, int height, int stride, int temporal_threshold, int spatial_threshold) {
+    const __m128i words_temporal_threshold = _mm_set1_epi16(temporal_threshold);
+    const __m128i words_spatial_threshold = _mm_set1_epi16(spatial_threshold);
+
+    memcpy(dstp, srccp, width);
+    srcpp += stride;
+    srccp += stride;
+    srcnp += stride;
+    dstp += stride;
+
+    const int pixels_in_mm = 8 / sizeof(uint8_t);
+    const int skip_left = 1;
+    const int skip_right = 1;
+
+    int width_sse2 = (width & ~(pixels_in_mm - 1)) + skip_left + skip_right;
+    if (width_sse2 > stride)
+        width_sse2 -= pixels_in_mm;
+
+    for (int y = 1; y < height - 1; y++) {
+        dstp[0] = srccp[0];
+
+        for (int x = skip_left; x < width_sse2 - skip_right; x += pixels_in_mm)
+            fluxsmooth_spatiotemporal_mmword_uint8_sse2(srcpp, srccp, srcnp, dstp, x, stride, words_temporal_threshold, words_spatial_threshold);
+
+        if (width + skip_left + skip_right > width_sse2)
+            fluxsmooth_spatiotemporal_mmword_uint8_sse2(srcpp, srccp, srcnp, dstp, width - pixels_in_mm - skip_right, stride, words_temporal_threshold, words_spatial_threshold);
+
+        dstp[width - 1] = srccp[width - 1];
+
+        srcpp += stride;
+        srccp += stride;
+        srcnp += stride;
+        dstp += stride;
+    }
+
+    memcpy(dstp, srccp, width);
 
 #undef zeroes
 }
@@ -314,13 +429,6 @@ static void fluxsmooth_temporal_uint16_c(const uint8_t *srcpp, const uint8_t *sr
         srcnp += stride;
         dstp += stride;
     }
-}
-#endif // FLUXSMOOTH_X86
-
-
-static void VS_CC fluxSmoothInit(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
-    FluxSmoothData *d = (FluxSmoothData *)*instanceData;
-    vsapi->setVideoInfo(d->vi, 1, node);
 }
 
 
@@ -429,6 +537,13 @@ static void fluxsmooth_spatiotemporal_uint8_c(const uint8_t *srcpp, const uint8_
     }
 
     memcpy(dstp, srccp, stride);
+}
+#endif // FLUXSMOOTH_X86
+
+
+static void VS_CC fluxSmoothInit(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
+    FluxSmoothData *d = (FluxSmoothData *)*instanceData;
+    vsapi->setVideoInfo(d->vi, 1, node);
 }
 
 
@@ -696,7 +811,11 @@ static void VS_CC fluxSmoothCreate(const VSMap *in, VSMap *out, void *userData, 
     // Select the functions.
     if (function == SpatioTemporalFlux) {
         if (d.vi->format->bytesPerSample == 1) {
+#if defined(FLUXSMOOTH_X86)
+            d.flux_function = fluxsmooth_spatiotemporal_uint8_sse2;
+#else
             d.flux_function = fluxsmooth_spatiotemporal_uint8_c;
+#endif
         } else {
             d.flux_function = fluxsmooth_spatiotemporal_uint16_c;
         }

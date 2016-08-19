@@ -61,9 +61,3 @@ License
 The original FluxSmooth author said:
 "There is no copyright on this code, and there are no conditions on its distribution or use. Do with it what you will."
 Thank you.
-
-
-To do
-=====
-
-Convert the asm for the spatiotemporal version from this 64 bit edition: http://forum.doom9.org/showthread.php?t=158245
