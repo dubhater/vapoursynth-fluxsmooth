@@ -227,7 +227,7 @@ static void fluxsmooth_temporal_uint16_sse2(const uint8_t *srcpp, const uint8_t 
 }
 
 
-static FORCE_INLINE void fluxsmooth_spatiotemporal_mmword_uint8_sse2(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, int x, int stride, const __m128i words_temporal_threshold, const __m128i words_spatial_threshold) {
+FORCE_INLINE void fluxsmooth_spatiotemporal_mmword_uint8_sse2(const uint8_t *srcpp, const uint8_t *srccp, const uint8_t *srcnp, uint8_t *dstp, int x, int stride, const __m128i words_temporal_threshold, const __m128i words_spatial_threshold) {
     __m128i prev = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srcpp[x]), zeroes);
     __m128i curr = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srccp[x]), zeroes);
     __m128i next = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)&srcnp[x]), zeroes);
